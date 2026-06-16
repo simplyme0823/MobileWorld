@@ -2,18 +2,19 @@
 
 import argparse
 import json
+import os
 import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
 
+from dotenv import dotenv_values
 from rich import box
 from rich.console import Console
 from rich.panel import Panel
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 from rich.table import Table
 
-from dotenv import dotenv_values
 from mobile_world.core.api.env import (
     DEFAULT_IMAGE,
     DEFAULT_NAME_PREFIX,
@@ -287,9 +288,18 @@ def configure_parser(subparsers: argparse._SubParsersAction) -> None:
     _add_common_options(exec_parser, prefix=True)
 
     # Check subcommand
-    env_subparsers.add_parser(
+    check_parser = env_subparsers.add_parser(
         "check",
         help="Check prerequisites for running MobileWorld (Docker, KVM)",
+    )
+    check_parser.add_argument(
+        "--mode",
+        choices=["default", "midscene"],
+        default=None,
+        help=(
+            "Environment validation mode. Use 'midscene' when MobileWorld is driven by "
+            "Midscene benchmark and model/API keys are not consumed by MobileWorld."
+        ),
     )
 
 
@@ -1009,7 +1019,11 @@ def _exec_container(args: argparse.Namespace) -> None:
     docker_exec_replace(container_name, command, interactive=True)
 
 
-def _check_env_file() -> tuple[bool, str, str | None]:
+def _resolve_mode(mode: str | None = None) -> str:
+    return (mode or os.getenv("MOBILE_WORLD_MODE") or "default").strip().lower()
+
+
+def _check_env_file(mode: str | None = None) -> tuple[bool, str, str | None]:
     """Check if .env file exists and has valid configuration.
 
     Returns:
@@ -1017,8 +1031,15 @@ def _check_env_file() -> tuple[bool, str, str | None]:
     """
 
     env_path = Path.cwd() / ".env"
+    resolved_mode = _resolve_mode(mode)
 
     if not env_path.exists():
+        if resolved_mode == "midscene":
+            return (
+                True,
+                ".env file not required in midscene mode",
+                "MOBILE_WORLD_MODE=midscene: MobileWorld does not consume model, MCP, or user-agent keys.",
+            )
         return (
             False,
             ".env file not found in current directory",
@@ -1057,12 +1078,19 @@ def _check_env_file() -> tuple[bool, str, str | None]:
             return False
         return True
 
-    # 1. Check API_KEY (required for all tasks)
+    if resolved_mode == "midscene":
+        return (
+            True,
+            ".env configured for midscene mode",
+            "MOBILE_WORLD_MODE=midscene: skipping MobileWorld model, MCP, and user-agent key validation.",
+        )
+
+    # 1. Check API_KEY (required for native MobileWorld agent runs)
     if not is_valid("API_KEY"):
         if env_vars.get("API_KEY") == placeholders["API_KEY"]:
             issues.append("API_KEY is still set to placeholder value")
         else:
-            issues.append("API_KEY is missing (required for all tasks)")
+            issues.append("API_KEY is missing (required for native MobileWorld agent runs)")
 
     # 2. Check MCP keys (optional - for MCP tasks)
     mcp_keys_missing = []
@@ -1114,7 +1142,7 @@ def _check_env_file() -> tuple[bool, str, str | None]:
 
 def _check_prerequisites(args: argparse.Namespace) -> None:
     """Check prerequisites for running MobileWorld."""
-    _ = args  # unused
+    mode = _resolve_mode(getattr(args, "mode", None))
 
     console.print(
         Panel(
@@ -1128,7 +1156,7 @@ def _check_prerequisites(args: argparse.Namespace) -> None:
     results = check_prerequisites()
 
     # Add .env file check
-    env_passed, env_message, env_details = _check_env_file()
+    env_passed, env_message, env_details = _check_env_file(mode)
     from mobile_world.runtime.utils.models import PrerequisiteCheckResult
 
     env_check = PrerequisiteCheckResult(
