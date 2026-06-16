@@ -53,6 +53,8 @@ def _execute_single_task(
 
     step = 0
     obs = env.initialize_task(task_name=task_name)
+    if hasattr(agent, "start_task"):
+        agent.start_task(task_name)
     agent.initialize(task_goal)
 
     while True:
@@ -105,6 +107,9 @@ def _execute_single_task(
     traj_logger.log_score(score=score, reason=reason)
 
     res = env.tear_down_task(task_type=task_name)
+    if hasattr(agent, "update_task_status"):
+        status = "Successful" if score > 0.5 else "Failed"
+        agent.update_task_status(status=status, reason=reason)
     agent.done()
     logger.debug(f"tear_down_task response: {res}")
 
@@ -194,6 +199,8 @@ def _process_task_on_env(
                         continue
                     else:
                         logger.exception(f"Error executing task {task_name}")
+                        if hasattr(agent, "update_task_status"):
+                            agent.update_task_status(status="Failed", reason=str(e))
                         return None
 
             task_duration = time.time() - task_start_time
