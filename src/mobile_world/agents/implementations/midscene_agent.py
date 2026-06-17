@@ -116,6 +116,9 @@ class MidsceneAgent(BaseAgent):
             device["type"] = "Remote"
             device["host"] = os.environ.get("ANDROID_REMOTE_HOST", "localhost")
             device["port"] = adb_port
+            device_id = os.environ.get("ANDROID_ADB_DEVICE_ID")
+            if device_id:
+                device["deviceId"] = device_id
 
         device["consolePort"] = int(console_port)
         adb_server_port = os.environ.get("ANDROID_ADB_SERVER_PORT")
