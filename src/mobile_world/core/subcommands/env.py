@@ -1056,6 +1056,7 @@ def _check_env_file(mode: str | None = None) -> tuple[bool, str, str | None]:
             f"Failed to read .env file: {e}",
             None,
         )
+    resolved_mode = _resolve_mode(mode or env_vars.get("MOBILE_WORLD_MODE"))
 
     issues = []
     warnings = []
