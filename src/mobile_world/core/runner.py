@@ -199,8 +199,6 @@ def _process_task_on_env(
                         continue
                     else:
                         logger.exception(f"Error executing task {task_name}")
-                        if hasattr(agent, "update_task_status"):
-                            agent.update_task_status(status="Failed", reason=str(e))
                         return None
 
             task_duration = time.time() - task_start_time

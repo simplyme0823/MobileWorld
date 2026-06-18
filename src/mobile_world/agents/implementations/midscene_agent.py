@@ -142,7 +142,6 @@ class MidsceneAgent(BaseAgent):
                     self.rpc_url,
                     headers={"Content-Type": "application/json"},
                     json=payload,
-                    timeout=300,
                 )
                 response.raise_for_status()
                 result = response.json()
