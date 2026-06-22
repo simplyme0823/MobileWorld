@@ -148,6 +148,9 @@ Edit the `.env` file and configure the following parameters:
 - `DASHSCOPE_API_KEY`: DashScope API key for MCP services
 - `MODELSCOPE_API_KEY`: ModelScope API key for MCP services
 
+**Runtime Mode:**
+- `MOBILE_WORLD_MODE`: Set to `midscene` when MobileWorld is launched by the Midscene benchmark runner. Leave as `default` for native MobileWorld agent runs.
+
 **Example `.env` file:**
 ```bash
 API_KEY=your_api_key_for_agent_model
@@ -157,6 +160,8 @@ MODELSCOPE_API_KEY=modelscope_api_key_for_mcp
 USER_AGENT_API_KEY=your_user_agent_llm_api_key
 USER_AGENT_BASE_URL=your_user_agent_base_url
 USER_AGENT_MODEL=gpt-4.1
+
+MOBILE_WORLD_MODE=default
 ```
 
 > **Note**: 
