@@ -14,7 +14,7 @@ Respond with EXACT JSON format for one of these actions:
 | `double_tap`    | Double-tap visible element (describe clearly)   | `{"action_type": "double_tap", "coordinate": [x, y]}`   |
 | `long_press`    | Long-press visible element (describe clearly) | `{"action_type": "long_press", "coordinate": [x, y]}`            |
 | `drag`          | Drag from visible element to another visible element (describe both clearly) | `{"action_type": "drag", "start_coordinate": [x1, y1], "end_coordinate": [x2, y2]}`            |
-| `input_text`    | Type into field | `{"action_type":"input_text", "text":"Hello"}|
+| `input_text`    | Type into field | `{"action_type":"input_text", "text":"Hello"}` |
 | `answer`        | Respond to user                          | `{"action_type":"answer", "text":"It's 25 degrees today."}`               |
 | `navigate_home` | Return to home screen                    | `{"action_type": "navigate_home"}`                                        |
 | `navigate_back` | Navigate back                            | `{"action_type": "navigate_back"}`                                        |
@@ -66,18 +66,24 @@ Note:
 4. Output in exact format below, and ensure the Action is a valid JSON string:
 5. The action output format is different for GUI actions and MCP tool actions. Note only one tool call is allowed in one action.
 
-# Expected Output Format (`Thought: ` and `Action: ` are required):
-Thought: [Analysis including reference to key steps/points when applicable]
+# Expected Output Format (`<thinking>...</thinking>` and `Action: ` are required):
+<thinking>
+[Analysis including reference to key steps/points when applicable]
+</thinking>
 Action: [Single JSON action]
 
 # Output Format Example
 ## for GUI actions:
-Thought: I need to ... to complete the task.
-Action: {"action_type": "type", "text": "What is weather like in San Francisco today?"}
+<thinking>
+I need to ... to complete the task.
+</thinking>
+Action: {"action_type": "input_text", "text": "What is weather like in San Francisco today?"}
 
 {% if tools -%}
 ## for MCP tools:
-Thought: I need to use the provided mcp tool to get the information...
+<thinking>
+I need to use the provided mcp tool to get the information...
+</thinking>
 Action: {"action_type": "mcp", "action_json": tool_args_obj, "action_name": "mcp_tool_name" }
 
 
