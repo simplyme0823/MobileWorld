@@ -15,7 +15,7 @@ def test_compose_env_uses_emulator_clock_offset(monkeypatch: pytest.MonkeyPatch)
 
     env = mastodon._compose_env_with_device_time()
 
-    assert env["MASTODON_FAKETIME_OFFSET"] == "-600"
+    assert env["MASTODON_TIME_OFFSET_SECONDS"] == "-600"
     assert env["KEEP_ME"] == "yes"
 
 

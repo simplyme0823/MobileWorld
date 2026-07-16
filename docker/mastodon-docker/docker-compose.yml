@@ -30,8 +30,7 @@ services:
 
   web:
     working_dir: /opt/mastodon
-    image: mobileworld/mastodon:v4.3.7-faketime
-    pull_policy: never
+    image: ghcr.io/mastodon/mastodon:v4.3.7
     depends_on:
       db:
         condition: service_healthy
@@ -39,13 +38,11 @@ services:
         condition: service_healthy
     env_file: .env.dev
     environment:
-      LD_PRELOAD: /usr/local/lib/libfaketime.so.1
-      FAKETIME: "${MASTODON_FAKETIME_OFFSET:-0}"
-      FAKETIME_DONT_FAKE_MONOTONIC: "1"
-      NO_FAKE_STAT: "1"
+      MASTODON_TIME_OFFSET_SECONDS: "${MASTODON_TIME_OFFSET_SECONDS:-0}"
     command: [ "bash", "-lc", "RAILS_ENV=production bundle exec rails db:prepare && bundle exec puma -C config/puma.rb" ]
     volumes:
       - ./data/media:/opt/mastodon/public/system
+      - ./mobileworld_clock.rb:/opt/mastodon/config/initializers/mobileworld_clock.rb:ro
     ports:
       - 3000:3000
     healthcheck:
@@ -66,20 +63,17 @@ services:
       - "4000"
 
   sidekiq:
-    image: mobileworld/mastodon:v4.3.7-faketime
-    pull_policy: never
+    image: ghcr.io/mastodon/mastodon:v4.3.7
     depends_on:
       web:
         condition: service_started
     env_file: .env.dev
     environment:
-      LD_PRELOAD: /usr/local/lib/libfaketime.so.1
-      FAKETIME: "${MASTODON_FAKETIME_OFFSET:-0}"
-      FAKETIME_DONT_FAKE_MONOTONIC: "1"
-      NO_FAKE_STAT: "1"
+      MASTODON_TIME_OFFSET_SECONDS: "${MASTODON_TIME_OFFSET_SECONDS:-0}"
     command: [ "bash", "-lc", "RAILS_ENV=production bundle exec rails db:prepare && bundle exec sidekiq" ]
     volumes:
       - ./data/media:/opt/mastodon/public/system
+      - ./mobileworld_clock.rb:/opt/mastodon/config/initializers/mobileworld_clock.rb:ro
 
   nginx:
     image: nginx:1.25-alpine

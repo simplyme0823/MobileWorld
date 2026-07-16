@@ -131,7 +131,7 @@ def _compose_env_with_device_time() -> dict[str, str]:
     host_epoch = int(time.time())
     offset_seconds = device_epoch - host_epoch
     env = os.environ.copy()
-    env["MASTODON_FAKETIME_OFFSET"] = str(offset_seconds)
+    env["MASTODON_TIME_OFFSET_SECONDS"] = str(offset_seconds)
     logger.info(
         "Starting Mastodon with emulator clock offset: "
         f"device_epoch={device_epoch}, host_epoch={host_epoch}, offset={offset_seconds}s"
