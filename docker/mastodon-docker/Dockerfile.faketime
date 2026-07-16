@@ -1,0 +1,12 @@
+FROM ghcr.io/mastodon/mastodon:v4.3.7
+
+USER root
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libfaketime \
+    && libfaketime_path="$(dpkg-query -L libfaketime | awk '/libfaketime\.so\.1$/ { print; exit }')" \
+    && test -n "$libfaketime_path" \
+    && ln -sf "$libfaketime_path" /usr/local/lib/libfaketime.so.1 \
+    && rm -rf /var/lib/apt/lists/*
+
+USER mastodon

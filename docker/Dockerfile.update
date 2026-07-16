@@ -26,5 +26,10 @@ RUN chmod +x /app/docker/start_emulator.sh
 COPY docker/proxy_chain.py /app/docker/proxy_chain.py
 RUN chmod +x /app/docker/proxy_chain.py
 
+# Preload the Mastodon image whose Rails clock follows the emulator. The DinD
+# entrypoint imports every tar under /app/images before a task starts.
+COPY docker/images/mastodon-v4.3.7-faketime.tar /app/images/
+COPY docker/mastodon-docker/docker-compose.yml /app/mastodon-docker-bk/docker-compose.yml
+
 # Update CMD to also tail dockerd log
 CMD tail -f /var/log/emulator.log /var/log/server.log /var/log/dockerd.err.log

@@ -117,6 +117,28 @@ def get_mastodon_services_info() -> str | None:
         return f"Error: {str(e)}"
 
 
+def _compose_env_with_device_time() -> dict[str, str]:
+    """Return a compose environment whose Rails clock follows the emulator."""
+    result = execute_adb("adb shell date +%s")
+    if not result.success:
+        raise RuntimeError(f"Failed to read emulator time: {result.error}")
+
+    try:
+        device_epoch = int(result.output.strip())
+    except ValueError as e:
+        raise RuntimeError(f"Invalid emulator epoch: {result.output!r}") from e
+
+    host_epoch = int(time.time())
+    offset_seconds = device_epoch - host_epoch
+    env = os.environ.copy()
+    env["MASTODON_FAKETIME_OFFSET"] = str(offset_seconds)
+    logger.info(
+        "Starting Mastodon with emulator clock offset: "
+        f"device_epoch={device_epoch}, host_epoch={host_epoch}, offset={offset_seconds}s"
+    )
+    return env
+
+
 def start_mastodon_backend(mastodon_backend_status_dir=MASTODON_STATUS_DIR) -> bool:
     """Start the Mastodon backend."""
     status = get_mastodon_backend_status()
@@ -132,7 +154,14 @@ def start_mastodon_backend(mastodon_backend_status_dir=MASTODON_STATUS_DIR) -> b
 
         # start services
         cmd = ["docker", "compose", "up", "-d"]
-        subprocess.run(cmd, cwd=MASTODON_DOCKER_DIR, capture_output=True, text=True, check=True)
+        subprocess.run(
+            cmd,
+            cwd=MASTODON_DOCKER_DIR,
+            env=_compose_env_with_device_time(),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
 
         # mastodon backend ready to use check
         while not _is_mastodon_ready():
