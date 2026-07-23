@@ -26,10 +26,5 @@ RUN chmod +x /app/docker/start_emulator.sh
 COPY docker/proxy_chain.py /app/docker/proxy_chain.py
 RUN chmod +x /app/docker/proxy_chain.py
 
-# Keep Rails wall-clock reads aligned with the emulator while leaving the
-# container, database, and monotonic clocks untouched.
-COPY docker/mastodon-docker/docker-compose.yml /app/mastodon-docker-bk/docker-compose.yml
-COPY docker/mastodon-docker/mobileworld_clock.rb /app/mastodon-docker-bk/mobileworld_clock.rb
-
 # Update CMD to also tail dockerd log
 CMD tail -f /var/log/emulator.log /var/log/server.log /var/log/dockerd.err.log

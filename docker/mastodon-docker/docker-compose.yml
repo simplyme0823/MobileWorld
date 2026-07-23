@@ -37,12 +37,9 @@ services:
       redis:
         condition: service_healthy
     env_file: .env.dev
-    environment:
-      MASTODON_TIME_OFFSET_SECONDS: "${MASTODON_TIME_OFFSET_SECONDS:-0}"
     command: [ "bash", "-lc", "RAILS_ENV=production bundle exec rails db:prepare && bundle exec puma -C config/puma.rb" ]
     volumes:
       - ./data/media:/opt/mastodon/public/system
-      - ./mobileworld_clock.rb:/opt/mastodon/config/initializers/mobileworld_clock.rb:ro
     ports:
       - 3000:3000
     healthcheck:
@@ -68,12 +65,9 @@ services:
       web:
         condition: service_started
     env_file: .env.dev
-    environment:
-      MASTODON_TIME_OFFSET_SECONDS: "${MASTODON_TIME_OFFSET_SECONDS:-0}"
     command: [ "bash", "-lc", "RAILS_ENV=production bundle exec rails db:prepare && bundle exec sidekiq" ]
     volumes:
       - ./data/media:/opt/mastodon/public/system
-      - ./mobileworld_clock.rb:/opt/mastodon/config/initializers/mobileworld_clock.rb:ro
 
   nginx:
     image: nginx:1.25-alpine
