@@ -11,6 +11,7 @@ from loguru import logger
 from markdownify import markdownify
 from PIL import Image
 
+from mobile_world.runtime.app_helpers.mastodon_gate import MASTODON_INIT_ERROR_CODE
 from mobile_world.runtime.mcp_server import init_mcp_clients
 from mobile_world.runtime.utils.models import MCP, NAVIGATE_HOME, JSONAction, Observation, Response
 from mobile_world.runtime.utils.trajectory_logger import SCORE_FILE_NAME
@@ -18,6 +19,23 @@ from mobile_world.tasks.registry import TaskRegistry
 
 TASK_META_DATA_PATH = "./new_task_metadata.json"
 DEFAULT_MAX_STEP = 15
+
+
+class EnvironmentInitializationError(RuntimeError):
+    """Structured environment failure returned by the MobileWorld server."""
+
+    def __init__(self, code: str, task_name: str, details: dict) -> None:
+        super().__init__(f"[{code}] Failed to initialize task {task_name}: {details}")
+        self.code = code
+        self.task_name = task_name
+        self.details = details
+
+    def to_dict(self) -> dict:
+        return {
+            "code": self.code,
+            "task": self.task_name,
+            "details": self.details,
+        }
 
 
 class AndroidEnvClient:
@@ -233,6 +251,15 @@ class AndroidEnvClient:
         try:
             init_data = {"task_name": task_name, "req_device": self.device}
             response = requests.post(f"{self.base_url}/task/init", json=init_data, timeout=300)
+            if response.status_code == 503:
+                payload = response.json()
+                details = payload.get("detail", {})
+                if details.get("code") == MASTODON_INIT_ERROR_CODE:
+                    raise EnvironmentInitializationError(
+                        code=MASTODON_INIT_ERROR_CODE,
+                        task_name=task_name,
+                        details=details,
+                    )
             response.raise_for_status()
 
             self._current_task_type = task_name
@@ -243,6 +270,8 @@ class AndroidEnvClient:
                 screenshot=res,
                 ask_user_response=None,
             )
+        except EnvironmentInitializationError:
+            raise
         except Exception as e:
             logger.error(f"Failed to initialize task {task_name}: {e}")
             raise RuntimeError(f"Failed to initialize task {task_name}: {e}")

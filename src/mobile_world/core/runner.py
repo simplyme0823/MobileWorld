@@ -13,6 +13,7 @@ from mobile_world.agents.registry import create_agent
 from mobile_world.runtime.client import (
     AndroidEnvClient,
     AndroidMCPEnvClient,
+    EnvironmentInitializationError,
     scan_finished_tasks,
 )
 from mobile_world.runtime.utils.docker import (
@@ -190,6 +191,17 @@ def _process_task_on_env(
                         enable_mcp=enable_mcp,
                     )
                     break
+                except EnvironmentInitializationError as error:
+                    logger.error(
+                        "Environment initialization failed for task {}: {}",
+                        task_name,
+                        error,
+                    )
+                    traj_logger.log_infra_error(error.to_dict())
+                    return {
+                        "task_name": task_name,
+                        "infra_error": error.code,
+                    }
                 except Exception as e:
                     if "Device is not healthy" in str(e) and retry_on_device_unhealthy > 0:
                         logger.warning("Device is not healthy, retrying...")
