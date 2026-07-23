@@ -1,10 +1,20 @@
 """Set up a new filter rule on Mastodon."""
 
+from datetime import datetime, timedelta
+
 from loguru import logger
 
 from mobile_world.runtime.app_helpers import mastodon
 from mobile_world.runtime.controller import AndroidController
 from mobile_world.tasks.base import BaseTask
+
+
+def _is_valid_expiry_duration(
+    expires_at: datetime, created_at: datetime, expected_days: int
+) -> bool:
+    """Check an expiry selected as a calendar date in the Mastodon Android app."""
+    duration = expires_at - created_at
+    return timedelta(days=expected_days - 1) < duration <= timedelta(days=expected_days)
 
 
 class MastodonNewFilterTask(BaseTask):
@@ -102,11 +112,14 @@ class MastodonNewFilterTask(BaseTask):
                 f"Invalid created_at in filter: phrase={self.EXPECTED_TITLE}, username={self.EXPECTED_USERNAME}",
             )
         else:
-            delta_days = (expires_at.date() - created_at.date()).days
-            if delta_days != self.EXPECTED_REMAINING_DAYS:
+            duration = expires_at - created_at
+            if not _is_valid_expiry_duration(expires_at, created_at, self.EXPECTED_REMAINING_DAYS):
+                duration_days = duration.total_seconds() / timedelta(days=1).total_seconds()
                 return (
                     0.0,
-                    f"Expiry days mismatch. expected={self.EXPECTED_REMAINING_DAYS}, got={delta_days}",
+                    "Expiry duration mismatch. "
+                    f"expected=({self.EXPECTED_REMAINING_DAYS - 1}, "
+                    f"{self.EXPECTED_REMAINING_DAYS}] days, got={duration_days:.2f}",
                 )
 
         return 1.0
