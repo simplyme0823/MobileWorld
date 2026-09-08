@@ -14,6 +14,10 @@ from mobile_world.runtime.app_helpers.mall import (
     clear_callback_files,
     clear_config,
 )
+from mobile_world.runtime.app_helpers.mastodon_gate import (
+    get_last_initialization_error,
+    initialization_context,
+)
 from mobile_world.runtime.app_helpers.system import (
     time_sync_to_now,
 )
@@ -125,19 +129,23 @@ class BaseTask(abc.ABC):
                 logger.error(f"Failed to sync time for {self.name}")
                 return False
 
-        ### app specific initialization, run before initialize_task_hook ###
-        ### in case some tasks forget to implement proper tear_down() ###
-        mattermost.stop_mattermost_backend()
-        mastodon.stop_mastodon_backend()
-        clear_config()
-        clear_callback_files(controller.device)
+        with initialization_context(self.name):
+            ### app specific initialization, run before initialize_task_hook ###
+            ### in case some tasks forget to implement proper tear_down() ###
+            mattermost.stop_mattermost_backend()
+            mastodon.stop_mastodon_backend()
+            clear_config()
+            clear_callback_files(controller.device)
 
-        logger.info(f"Initializing {self.name}")
-        init_hook_res = self.initialize_task_hook(controller)
-        if isinstance(init_hook_res, bool) and not init_hook_res:
-            # only raise error if the task hook explicitly returns False, otherwise continue for True or None
-            logger.error(f"Failed to initialize task hook for {self.name}")
-            return False
+            logger.info(f"Initializing {self.name}")
+            init_hook_res = self.initialize_task_hook(controller)
+            if isinstance(init_hook_res, bool) and not init_hook_res:
+                # only raise error if the task hook explicitly returns False, otherwise continue for True or None
+                logger.error(f"Failed to initialize task hook for {self.name}")
+                mastodon_error = get_last_initialization_error()
+                if mastodon_error is not None:
+                    raise mastodon_error
+                return False
 
         self.initialize_user_agent_hook(controller)
 

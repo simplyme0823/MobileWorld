@@ -68,6 +68,16 @@ services:
     command: [ "bash", "-lc", "RAILS_ENV=production bundle exec rails db:prepare && bundle exec sidekiq" ]
     volumes:
       - ./data/media:/opt/mastodon/public/system
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "ps -eo comm=,args= | awk '$$1 !~ /^(bash|sh|grep|awk|pgrep)$/ && /sidekiq/ { found=1 } END { exit !found }'",
+        ]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+      start_period: 15s
 
   nginx:
     image: nginx:1.25-alpine

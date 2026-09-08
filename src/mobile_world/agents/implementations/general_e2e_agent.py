@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import time
 from typing import Any
 
@@ -14,10 +15,15 @@ from mobile_world.runtime.utils.parsers import parse_json_markdown
 
 ACTION_ALIASES = {
     "click": ["tap", "press", "touch"],
+    "double_tap": ["double tap", "double_click", "double click"],
     "long_press": ["long tap", "long press", "hold"],
     "input_text": ["type", "enter_text", "write", "enter"],
     "scroll": ["swipe", "fling"],
     "keyboard_enter": ["enter"],
+    "navigate_back": ["back", "go_back", "press_back"],
+    "navigate_home": ["home", "press_home"],
+    "open_app": ["open", "launch", "launch_app"],
+    "finished": ["finish", "done", "terminate"],
 }
 NORMALIZED_ACTION_MAP = {}
 for standard_action, aliases in ACTION_ALIASES.items():
@@ -28,22 +34,65 @@ for standard_action, aliases in ACTION_ALIASES.items():
 
 CLAUDE_IMAGE_SIZE = (1280, 720)
 CLAUDE_OPUS_MAX_DIMENSION = 1280
+ACTION_MARKER_RE = re.compile(r"(?i)\bAction\s*[:：]\s*")
+THINKING_TAG_RE = re.compile(r"<thinking>\s*(.*?)\s*</thinking>", re.IGNORECASE | re.DOTALL)
+ACTION_TAG_RE = re.compile(r"<action>\s*(.*?)\s*</action>", re.IGNORECASE | re.DOTALL)
+JSON_START_RE = re.compile(r"[\[{]")
+
+POINT_KEYS = ("coordinate", "coordinates", "point", "position", "target_coordinate")
+START_POINT_KEYS = ("start_coordinate", "start_coordinates", "start_point", "start", "from")
+END_POINT_KEYS = ("end_coordinate", "end_coordinates", "end_point", "end", "to")
+PARAM_KEYS = ("params", "parameters", "args", "arguments")
+TEXT_KEYS = ("text", "content", "value", "answer", "message")
+APP_NAME_KEYS = ("app_name", "app", "application", "package", "package_name", "name")
 
 
-def normalize_action_type(action_type: str) -> str:
+def normalize_action_type(action_type: str | None) -> str | None:
     if not action_type:
         return None
     processed_type = action_type.lower().strip().replace(" ", "_")
     return NORMALIZED_ACTION_MAP.get(processed_type, action_type)
 
 
+def _find_json_start(text: str) -> int | None:
+    match = JSON_START_RE.search(text)
+    return match.start() if match else None
+
+
+def _extract_action_payload(text: str) -> str:
+    """Return the JSON-like action payload from common LLM wrappers."""
+    payload = text.strip()
+    action_tag = ACTION_TAG_RE.search(payload)
+    if action_tag:
+        payload = action_tag.group(1).strip()
+
+    json_start = _find_json_start(payload)
+    if json_start is not None and json_start > 0:
+        payload = payload[json_start:].strip()
+
+    return payload
+
+
+def _extract_thought(text: str, action_start: int | None = None) -> str:
+    prefix = text[:action_start].strip() if action_start is not None else text.strip()
+
+    thinking_match = THINKING_TAG_RE.search(prefix) or THINKING_TAG_RE.search(text)
+    if thinking_match:
+        return thinking_match.group(1).strip()
+
+    prefix = re.sub(r"^\s*Thought\s*[:：]\s*", "", prefix, flags=re.IGNORECASE)
+    return prefix.strip()
+
+
 def parse_action(plan_output: str) -> tuple[str, str]:
     """
     Parse the Thought and Action from agent output.
 
-    Expected format:
-    Thought: [analysis]
+    Expected formats:
+    <thinking>[analysis]</thinking>
     Action: [json_action]
+
+    Legacy Thought:/Action: and bare JSON action outputs are also accepted.
 
     Args:
         plan_output: Raw output from agent
@@ -52,17 +101,20 @@ def parse_action(plan_output: str) -> tuple[str, str]:
         Tuple of (thought, action)
     """
     try:
-        parts = plan_output.rsplit("Action:", 1)
-
-        if len(parts) != 2:
-            raise ValueError("Expected exactly one 'Action:' in the output")
-        thought_part = parts[0].strip()
-        if thought_part.startswith("Thought:"):
-            thought = thought_part[8:].strip()  # Remove 'Thought:' prefix
+        action_matches = list(ACTION_MARKER_RE.finditer(plan_output))
+        if action_matches:
+            action_marker = action_matches[-1]
+            thought = _extract_thought(plan_output, action_marker.start())
+            action = plan_output[action_marker.end() :].strip()
+        elif ACTION_TAG_RE.search(plan_output) or _find_json_start(plan_output) is not None:
+            thought = _extract_thought(plan_output, _find_json_start(plan_output))
+            action = _extract_action_payload(plan_output)
         else:
-            thought = thought_part
+            raise ValueError("Expected 'Action:' or a JSON action payload in the output")
 
-        action = parts[1].strip()
+        action = _extract_action_payload(action)
+        if not action:
+            raise ValueError("Action payload is empty")
 
         return thought, action
 
@@ -70,6 +122,148 @@ def parse_action(plan_output: str) -> tuple[str, str]:
         logger.error(f"Error parsing output: {e}")
         logger.debug(f"Output: {plan_output}")
         raise ValueError(f"Output is not in the correct format: {e}")
+
+
+def _coerce_number(value: Any) -> float:
+    if isinstance(value, str):
+        value = value.strip()
+    return float(value)
+
+
+def _coerce_point(value: Any) -> list[float] | None:
+    if isinstance(value, dict):
+        if "x" in value and "y" in value:
+            return [_coerce_number(value["x"]), _coerce_number(value["y"])]
+        for key in POINT_KEYS:
+            if key in value:
+                point = _coerce_point(value[key])
+                if point is not None:
+                    return point
+        return None
+
+    if isinstance(value, (list, tuple)) and len(value) >= 2:
+        if isinstance(value[0], (list, tuple, dict)):
+            return None
+        return [_coerce_number(value[0]), _coerce_number(value[1])]
+
+    if isinstance(value, str):
+        numbers = re.findall(r"-?\d+(?:\.\d+)?", value)
+        if len(numbers) >= 2:
+            return [_coerce_number(numbers[0]), _coerce_number(numbers[1])]
+
+    return None
+
+
+def _get_point(action_data: dict[str, Any], keys: tuple[str, ...]) -> list[float] | None:
+    for key in keys:
+        if key in action_data:
+            point = _coerce_point(action_data[key])
+            if point is not None:
+                return point
+
+    if keys == POINT_KEYS and "x" in action_data and "y" in action_data:
+        return [_coerce_number(action_data["x"]), _coerce_number(action_data["y"])]
+
+    return None
+
+
+def _get_drag_points(action_data: dict[str, Any]) -> tuple[list[float], list[float]] | None:
+    if "points" in action_data and isinstance(action_data["points"], (list, tuple)):
+        points = action_data["points"]
+        if len(points) >= 2:
+            start = _coerce_point(points[0])
+            end = _coerce_point(points[1])
+            if start is not None and end is not None:
+                return start, end
+
+    start = _get_point(action_data, START_POINT_KEYS)
+    end = _get_point(action_data, END_POINT_KEYS)
+    if start is not None and end is not None:
+        return start, end
+
+    if all(key in action_data for key in ("start_x", "start_y", "end_x", "end_y")):
+        return (
+            [_coerce_number(action_data["start_x"]), _coerce_number(action_data["start_y"])],
+            [_coerce_number(action_data["end_x"]), _coerce_number(action_data["end_y"])],
+        )
+
+    return None
+
+
+def _to_absolute_point(
+    point: list[float],
+    image_width: int,
+    image_height: int,
+    scale_factor_x: int,
+    scale_factor_y: int,
+) -> tuple[int, int]:
+    absolute_x = int(point[0] * image_width / scale_factor_x)
+    absolute_y = int(point[1] * image_height / scale_factor_y)
+    return absolute_x, absolute_y
+
+
+def _merge_parameter_block(action_data: dict[str, Any]) -> dict[str, Any]:
+    for key in PARAM_KEYS:
+        params = action_data.get(key)
+        if isinstance(params, dict):
+            for param_key, param_value in params.items():
+                action_data.setdefault(param_key, param_value)
+    return action_data
+
+
+def _first_present(action_data: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    for key in keys:
+        value = action_data.get(key)
+        if value is not None:
+            return value
+    return None
+
+
+def _normalize_action_shape(action_data: Any) -> dict[str, Any]:
+    if isinstance(action_data, list):
+        if len(action_data) != 1 or not isinstance(action_data[0], dict):
+            raise ValueError(f"Expected a single action object, got: {action_data}")
+        action_data = action_data[0]
+
+    if not isinstance(action_data, dict):
+        raise ValueError(f"Expected JSON action object, got: {type(action_data).__name__}")
+
+    nested_action = action_data.get("action")
+    if isinstance(nested_action, dict):
+        merged_action = {**action_data, **nested_action}
+        merged_action.pop("action", None)
+        action_data = merged_action
+
+    action_data = _merge_parameter_block(action_data)
+
+    if not action_data.get("action_type"):
+        for key in ("action", "type", "name"):
+            action_value = action_data.get(key)
+            if isinstance(action_value, str):
+                action_data["action_type"] = action_value
+                break
+
+    original_action_type = action_data.get("action_type")
+    if (
+        isinstance(original_action_type, str)
+        and original_action_type.lower().strip().replace(" ", "_") == "swipe"
+        and _get_drag_points(action_data) is not None
+    ):
+        action_data["action_type"] = "drag"
+
+    if action_data.get("action_type") == "mcp":
+        if not action_data.get("action_name"):
+            for key in ("name", "tool_name", "function_name"):
+                if isinstance(action_data.get(key), str):
+                    action_data["action_name"] = action_data[key]
+                    break
+        if not action_data.get("action_json"):
+            for key in PARAM_KEYS:
+                if isinstance(action_data.get(key), dict):
+                    action_data["action_json"] = action_data[key]
+                    break
+
+    return action_data
 
 
 def parse_response_to_action(
@@ -91,7 +285,8 @@ def parse_response_to_action(
         Dictionary with action type and absolute coordinates
     """
     try:
-        action_data = parse_json_markdown(action_str)
+        action_data = parse_json_markdown(_extract_action_payload(action_str))
+        action_data = _normalize_action_shape(action_data)
         original_action_type = action_data.get("action_type")
         normalized_action_type = normalize_action_type(original_action_type)
 
@@ -104,71 +299,77 @@ def parse_response_to_action(
             [scale_factor, scale_factor] if isinstance(scale_factor, int) else scale_factor
         )
 
+        if (
+            action_type == "scroll"
+            and "direction" not in action_data
+            and action_data.get("scroll_direction") is not None
+        ):
+            action_data["direction"] = action_data["scroll_direction"]
+        if action_type in ["input_text", "answer", "ask_user"] and "text" not in action_data:
+            text_value = _first_present(action_data, TEXT_KEYS)
+            if text_value is not None:
+                action_data["text"] = text_value
+        if action_type == "open_app" and "app_name" not in action_data:
+            app_name_value = _first_present(action_data, APP_NAME_KEYS)
+            if app_name_value is not None:
+                action_data["app_name"] = app_name_value
+        if (
+            action_type == "status"
+            and "goal_status" not in action_data
+            and action_data.get("status") is not None
+        ):
+            action_data["goal_status"] = action_data["status"]
+
         # Handle coordinate-based actions
         if action_type in ["click", "double_tap", "long_press"]:
             # Ensure coordinate is present
-            if "coordinate" in action_data:
-                coord = action_data["coordinate"]
-                if isinstance(coord, list) and len(coord) == 2:
-                    # Convert relative coordinates (0-999) to absolute coordinates
-                    relative_x, relative_y = coord[0], coord[1]
-
-                    absolute_x = int(relative_x * image_width / scale_factor_x)
-                    absolute_y = int(relative_y * image_height / scale_factor_y)
-
-                    logger.debug(
-                        f"Coordinate conversion: relative ({relative_x}, {relative_y}) -> absolute ({absolute_x}, {absolute_y})"
-                    )
-
-                    return {
-                        "action_type": action_type,
-                        "x": absolute_x,
-                        "y": absolute_y,
-                    }
-                else:
-                    raise ValueError(f"Invalid coordinate format: {coord}")
-            else:
+            coord = _get_point(action_data, POINT_KEYS)
+            if coord is None:
                 raise ValueError(f"Missing coordinate for action type: {action_type}")
+
+            # Convert relative coordinates (0-999) to absolute coordinates
+            absolute_x, absolute_y = _to_absolute_point(
+                coord, image_width, image_height, scale_factor_x, scale_factor_y
+            )
+
+            logger.debug(
+                f"Coordinate conversion: relative ({coord[0]}, {coord[1]}) -> absolute ({absolute_x}, {absolute_y})"
+            )
+
+            return {
+                "action_type": action_type,
+                "x": absolute_x,
+                "y": absolute_y,
+            }
 
         # Handle drag action
         elif action_type == "drag":
-            if "start_coordinate" in action_data and "end_coordinate" in action_data:
-                start_coord = action_data["start_coordinate"]
-                end_coord = action_data["end_coordinate"]
-                if (
-                    isinstance(start_coord, list)
-                    and len(start_coord) == 2
-                    and isinstance(end_coord, list)
-                    and len(end_coord) == 2
-                ):
-                    # Convert relative coordinates (0-999) to absolute coordinates
-                    relative_start_x, relative_start_y = start_coord[0], start_coord[1]
-                    relative_end_x, relative_end_y = end_coord[0], end_coord[1]
-
-                    absolute_start_x = int(relative_start_x * image_width / scale_factor_x)
-                    absolute_start_y = int(relative_start_y * image_height / scale_factor_y)
-                    absolute_end_x = int(relative_end_x * image_width / scale_factor_x)
-                    absolute_end_y = int(relative_end_y * image_height / scale_factor_y)
-
-                    logger.debug(
-                        f"Drag coordinate conversion: relative ({relative_start_x}, {relative_start_y}) -> ({relative_end_x}, {relative_end_y}) | absolute ({absolute_start_x}, {absolute_start_y}) -> ({absolute_end_x}, {absolute_end_y})"
-                    )
-
-                    return {
-                        "action_type": "drag",
-                        "start_x": absolute_start_x,
-                        "start_y": absolute_start_y,
-                        "end_x": absolute_end_x,
-                        "end_y": absolute_end_y,
-                    }
-                else:
-                    raise ValueError(f"Invalid drag coordinates: {start_coord}, {end_coord}")
-            else:
+            drag_points = _get_drag_points(action_data)
+            if drag_points is None:
                 raise ValueError("Missing coordinates for drag action")
+
+            start_coord, end_coord = drag_points
+            absolute_start_x, absolute_start_y = _to_absolute_point(
+                start_coord, image_width, image_height, scale_factor_x, scale_factor_y
+            )
+            absolute_end_x, absolute_end_y = _to_absolute_point(
+                end_coord, image_width, image_height, scale_factor_x, scale_factor_y
+            )
+
+            logger.debug(
+                f"Drag coordinate conversion: relative ({start_coord[0]}, {start_coord[1]}) -> ({end_coord[0]}, {end_coord[1]}) | absolute ({absolute_start_x}, {absolute_start_y}) -> ({absolute_end_x}, {absolute_end_y})"
+            )
+
+            return {
+                "action_type": "drag",
+                "start_x": absolute_start_x,
+                "start_y": absolute_start_y,
+                "end_x": absolute_end_x,
+                "end_y": absolute_end_y,
+            }
 
         # Handle other action types
         elif action_type in [
-            "open_app",
             "answer",
             "navigate_home",
             "navigate_back",
@@ -178,6 +379,11 @@ def parse_response_to_action(
             "keyboard_enter",
         ]:
             return action_data
+        elif action_type == "open_app":
+            return {
+                "action_type": "open_app",
+                "app_name": action_data.get("app_name", ""),
+            }
         elif action_type == "input_text":
             return {
                 "action_type": "input_text",

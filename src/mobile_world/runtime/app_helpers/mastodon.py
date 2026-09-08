@@ -5,7 +5,10 @@ import re
 import shutil
 import subprocess
 import time
+from collections.abc import Callable
 from datetime import datetime
+from time import monotonic
+from typing import Any
 
 import imagehash
 import psycopg2
@@ -16,6 +19,12 @@ from loguru import logger
 from PIL import Image
 from psycopg2 import Error
 
+from mobile_world.runtime.app_helpers.mastodon_gate import (
+    MastodonInitializationError,
+    get_current_task_name,
+    record_gate_event,
+    set_last_initialization_error,
+)
 from mobile_world.runtime.controller import AndroidController
 from mobile_world.runtime.utils.helpers import execute_adb
 
@@ -33,6 +42,10 @@ MASTODON_HEALTH_URL = "https://localhost/api/v1/instance"  # need host header 10
 
 PUBLIC_SYSTEM_ROOT = "/opt/mastodon/public/system"  # media directory inside the container
 MEDIA_ROOT = "/app/mastodon-docker/data/media"  # for docker-in-docker development
+MASTODON_INIT_MAX_ATTEMPTS = 3
+MASTODON_INIT_TIMEOUT_SECONDS = 90
+MASTODON_GATE_POLL_INTERVAL_SECONDS = 2
+MASTODON_DIAGNOSTIC_LOG_TAIL = 200
 
 
 def copytree_with_ownership(src, dst):
@@ -58,14 +71,7 @@ def get_mastodon_backend_status() -> str:
         if not result.stdout.strip():
             return "stopped"
 
-        services = []
-        for line in result.stdout.strip().split("\n"):
-            if line.strip():
-                try:
-                    service = json.loads(line)
-                    services.append(service)
-                except json.JSONDecodeError:
-                    continue
+        services = _parse_compose_ps_output(result.stdout)
 
         if not services:
             return "stopped"
@@ -118,51 +124,380 @@ def get_mastodon_services_info() -> str | None:
 
 
 def start_mastodon_backend(mastodon_backend_status_dir=MASTODON_STATUS_DIR) -> bool:
-    """Start the Mastodon backend."""
-    status = get_mastodon_backend_status()
-    if status in ["running", "partial"]:
-        logger.info("Mastodon backend is already running, stop and reset it to default")
-        stop_mastodon_backend()
+    """Restore and start Mastodon, requiring every readiness gate to pass."""
+
+    last_reason = "unknown initialization error"
+    for attempt in range(1, MASTODON_INIT_MAX_ATTEMPTS + 1):
+        attempt_started_at = monotonic()
+        record_gate_event(
+            "initialization_attempt_started",
+            attempt=attempt,
+            maxAttempts=MASTODON_INIT_MAX_ATTEMPTS,
+        )
+        try:
+            _initialize_mastodon_attempt(
+                mastodon_backend_status_dir=mastodon_backend_status_dir,
+                attempt=attempt,
+            )
+            record_gate_event(
+                "initialization_succeeded",
+                attempt=attempt,
+                durationMs=_duration_ms(attempt_started_at),
+            )
+            return True
+        except Exception as error:
+            last_reason = str(error)
+            diagnostics = _collect_mastodon_diagnostics()
+            record_gate_event(
+                "initialization_attempt_failed",
+                attempt=attempt,
+                durationMs=_duration_ms(attempt_started_at),
+                reason=last_reason,
+                diagnostics=diagnostics,
+            )
+            logger.error(
+                f"Mastodon initialization attempt {attempt}/"
+                f"{MASTODON_INIT_MAX_ATTEMPTS} failed: {error}"
+            )
+            try:
+                stop_mastodon_backend()
+            except Exception as stop_error:
+                logger.warning(f"Failed to stop Mastodon after initialization error: {stop_error}")
+            if attempt < MASTODON_INIT_MAX_ATTEMPTS:
+                time.sleep(MASTODON_GATE_POLL_INTERVAL_SECONDS)
+
+    task_name = get_current_task_name()
+    initialization_error = MastodonInitializationError(
+        task_name=task_name,
+        attempts=MASTODON_INIT_MAX_ATTEMPTS,
+        reason=last_reason,
+    )
+    set_last_initialization_error(initialization_error)
+    record_gate_event(
+        "initialization_failed",
+        attempts=MASTODON_INIT_MAX_ATTEMPTS,
+        code=initialization_error.to_dict()["code"],
+        reason=last_reason,
+    )
+    raise initialization_error
+
+
+def _initialize_mastodon_attempt(
+    mastodon_backend_status_dir: str,
+    attempt: int,
+) -> None:
+    _run_gate(
+        attempt,
+        "stop_previous_backend",
+        lambda: _require_success(
+            stop_mastodon_backend(),
+            "failed to stop previous Mastodon backend",
+        ),
+    )
+    _run_gate(
+        attempt,
+        "restore_seed",
+        lambda: _restore_mastodon_seed(mastodon_backend_status_dir),
+    )
+    _run_gate(attempt, "compose_up", _start_mastodon_compose)
+
+    deadline = monotonic() + MASTODON_INIT_TIMEOUT_SECONDS
+    _wait_for_gate(attempt, "rails_api", _get_mastodon_api_health, deadline)
+    _wait_for_gate(
+        attempt,
+        "sidekiq_healthy",
+        lambda: _get_compose_service_health("sidekiq"),
+        deadline,
+    )
+
+
+def _run_gate(
+    attempt: int,
+    gate: str,
+    operation: Callable[[], dict[str, Any] | None],
+) -> dict[str, Any]:
+    started_at = monotonic()
+    record_gate_event("gate_started", attempt=attempt, gate=gate)
+    try:
+        details = operation() or {}
+    except Exception as error:
+        record_gate_event(
+            "gate_failed",
+            attempt=attempt,
+            gate=gate,
+            durationMs=_duration_ms(started_at),
+            reason=str(error),
+        )
+        raise
+
+    record_gate_event(
+        "gate_passed",
+        attempt=attempt,
+        gate=gate,
+        durationMs=_duration_ms(started_at),
+        details=details,
+    )
+    return details
+
+
+def _wait_for_gate(
+    attempt: int,
+    gate: str,
+    check: Callable[[], tuple[bool, dict[str, Any]]],
+    deadline: float,
+) -> dict[str, Any]:
+    started_at = monotonic()
+    last_details: dict[str, Any] = {}
+    checks = 0
+    record_gate_event("gate_started", attempt=attempt, gate=gate)
+
+    while monotonic() < deadline:
+        checks += 1
+        try:
+            ready, last_details = check()
+        except Exception as error:
+            ready = False
+            last_details = {"error": str(error)}
+
+        if ready:
+            record_gate_event(
+                "gate_passed",
+                attempt=attempt,
+                gate=gate,
+                durationMs=_duration_ms(started_at),
+                checks=checks,
+                details=last_details,
+            )
+            return last_details
+        time.sleep(MASTODON_GATE_POLL_INTERVAL_SECONDS)
+
+    reason = f"{gate} did not become ready before timeout"
+    record_gate_event(
+        "gate_failed",
+        attempt=attempt,
+        gate=gate,
+        durationMs=_duration_ms(started_at),
+        checks=checks,
+        reason=reason,
+        details=last_details,
+    )
+    raise TimeoutError(f"{reason}: {last_details}")
+
+
+def _restore_mastodon_seed(mastodon_backend_status_dir: str) -> dict[str, Any]:
     shutil.rmtree(MASTODON_DOCKER_DIR, ignore_errors=True)
+    if not mastodon_backend_status_dir:
+        raise RuntimeError("Mastodon backend seed directory is not configured")
+    if not os.path.exists(mastodon_backend_status_dir):
+        raise FileNotFoundError(
+            f"Mastodon backend seed directory not found: {mastodon_backend_status_dir}"
+        )
+
+    copytree_with_ownership(mastodon_backend_status_dir, MASTODON_DOCKER_DIR)
+    return {
+        "source": mastodon_backend_status_dir,
+        "destination": MASTODON_DOCKER_DIR,
+    }
+
+
+def _start_mastodon_compose() -> dict[str, Any]:
+    result = subprocess.run(
+        ["docker", "compose", "up", "-d"],
+        cwd=MASTODON_DOCKER_DIR,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=MASTODON_INIT_TIMEOUT_SECONDS,
+    )
+    return {
+        "returnCode": result.returncode,
+        "stdout": result.stdout.strip(),
+        "stderr": result.stderr.strip(),
+    }
+
+
+def _get_compose_service_health(service: str) -> tuple[bool, dict[str, Any]]:
+    result = subprocess.run(
+        ["docker", "compose", "ps", "--format", "json", service],
+        cwd=MASTODON_DOCKER_DIR,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=10,
+    )
+    entries = _parse_compose_ps_output(result.stdout)
+    if not entries:
+        return False, {"service": service, "state": "missing", "health": ""}
+
+    entry = entries[-1]
+    state = str(entry.get("State", "")).lower()
+    health = str(entry.get("Health", "")).lower()
+    ready = state == "running" and health == "healthy"
+    return ready, {
+        "service": service,
+        "state": state,
+        "health": health,
+        "exitCode": entry.get("ExitCode"),
+    }
+
+
+def _get_mastodon_api_health() -> tuple[bool, dict[str, Any]]:
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    try:
+        response = requests.get(
+            MASTODON_HEALTH_URL,
+            timeout=3,
+            headers={"Host": MASTODON_LOCAL_DOMAIN},
+            verify=False,
+        )
+        return 200 <= response.status_code < 300, {
+            "url": MASTODON_HEALTH_URL,
+            "host": MASTODON_LOCAL_DOMAIN,
+            "httpStatus": response.status_code,
+        }
+    except Exception as error:
+        return False, {
+            "url": MASTODON_HEALTH_URL,
+            "host": MASTODON_LOCAL_DOMAIN,
+            "error": str(error),
+        }
+
+
+def _collect_mastodon_diagnostics() -> dict[str, Any]:
+    if not os.path.exists(MASTODON_DOCKER_DIR):
+        return {"composeDir": "missing"}
+
+    compose_ps = _run_diagnostic_command(["docker", "compose", "ps", "--all", "--format", "json"])
+    container_names = _extract_compose_container_names(compose_ps.get("stdout", ""))
+
+    return {
+        "composePs": compose_ps,
+        "containerStates": [
+            _run_diagnostic_command(
+                [
+                    "docker",
+                    "inspect",
+                    "--format",
+                    (
+                        '{"name":{{json .Name}},"status":{{json .State.Status}},'
+                        '"health":{{if .State.Health}}'
+                        '{{json .State.Health.Status}}{{else}}""{{end}},'
+                        '"exitCode":{{.State.ExitCode}},'
+                        '"oomKilled":{{.State.OOMKilled}},'
+                        '"restartCount":{{.RestartCount}},'
+                        '"error":{{json .State.Error}}}'
+                    ),
+                    container_name,
+                ]
+            )
+            for container_name in container_names
+        ],
+        "serviceLogs": _run_diagnostic_command(
+            [
+                "docker",
+                "compose",
+                "logs",
+                "--no-color",
+                "--timestamps",
+                f"--tail={MASTODON_DIAGNOSTIC_LOG_TAIL}",
+                "db",
+                "redis",
+                "web",
+                "sidekiq",
+                "nginx",
+            ]
+        ),
+    }
+
+
+def _parse_compose_ps_output(output: str) -> list[dict[str, Any]]:
+    """Parse both JSON-array and JSON-lines output emitted by Compose versions."""
+
+    stripped = output.strip()
+    if not stripped:
+        return []
 
     try:
-        # copy the backend status directory to the docker directory
-        if mastodon_backend_status_dir:
-            copytree_with_ownership(mastodon_backend_status_dir, MASTODON_DOCKER_DIR)
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError:
+        parsed = None
 
-        # start services
-        cmd = ["docker", "compose", "up", "-d"]
-        subprocess.run(cmd, cwd=MASTODON_DOCKER_DIR, capture_output=True, text=True, check=True)
+    if isinstance(parsed, list):
+        return [entry for entry in parsed if isinstance(entry, dict)]
+    if isinstance(parsed, dict):
+        return [parsed]
 
-        # mastodon backend ready to use check
-        while not _is_mastodon_ready():
-            time.sleep(3)
+    entries: list[dict[str, Any]] = []
+    for line in stripped.splitlines():
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(entry, dict):
+            entries.append(entry)
+    return entries
 
-        return True
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Failed to start Mastodon backend: {e}")
-        logger.error(f"Error output: {e.stderr}")
-        return False
-    except Exception as e:
-        logger.error(f"Unexpected error starting Mastodon backend: {e}")
-        return False
+
+def _extract_compose_container_names(output: str) -> list[str]:
+    names: list[str] = []
+    for entry in _parse_compose_ps_output(output):
+        name = entry.get("Name")
+        if isinstance(name, str) and name:
+            names.append(name)
+    return names
+
+
+def _run_diagnostic_command(command: list[str]) -> dict[str, Any]:
+    try:
+        result = subprocess.run(
+            command,
+            cwd=MASTODON_DOCKER_DIR,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=20,
+        )
+        return {
+            "command": command,
+            "returnCode": result.returncode,
+            "stdout": result.stdout.strip(),
+            "stderr": result.stderr.strip(),
+        }
+    except Exception as error:
+        return {"command": command, "error": str(error)}
+
+
+def _require_success(success: bool, error_message: str) -> dict[str, Any]:
+    if not success:
+        raise RuntimeError(error_message)
+    return {"success": True}
+
+
+def _duration_ms(started_at: float) -> int:
+    return round((monotonic() - started_at) * 1000)
 
 
 def stop_mastodon_backend() -> bool:
     """Stop the Mastodon backend."""
+    if not os.path.exists(MASTODON_DOCKER_DIR):
+        return True
+
     try:
-        status = get_mastodon_backend_status()
-        if status == "stopped":
-            return True
-        # Change to mastodon docker directory and stop services
-        cmd = ["docker", "compose", "down"]
+        # Always run compose down when the directory exists. Exited containers and
+        # networks must also be removed before restoring the seed for the next attempt.
+        cmd = ["docker", "compose", "down", "--remove-orphans"]
         result = subprocess.run(
-            cmd, cwd=MASTODON_DOCKER_DIR, capture_output=True, text=True, check=True
+            cmd,
+            cwd=MASTODON_DOCKER_DIR,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=MASTODON_INIT_TIMEOUT_SECONDS,
         )
         logger.info("Mastodon backend stopped successfully")
         logger.debug(f"Docker compose output: {result.stdout}\n{result.stderr}")
 
-        shutil.rmtree(MASTODON_DOCKER_DIR)
+        shutil.rmtree(MASTODON_DOCKER_DIR, ignore_errors=True)
         return True
     except subprocess.CalledProcessError as e:
         logger.error(f"Failed to stop Mastodon backend: {e}")
@@ -196,21 +531,10 @@ def restart_mastodon_backend() -> bool:
 
 def _is_mastodon_ready() -> bool:
     """Check whether the Mastodon ready"""
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-    try:
-        resp = requests.get(
-            MASTODON_HEALTH_URL,
-            timeout=3,
-            headers={"Host": MASTODON_LOCAL_DOMAIN},
-            verify=False,
-        )
-        if 200 <= resp.status_code < 300:
-            return True
-        logger.info("Mastodon web not ready")
-        return False
-    except Exception as e:
-        logger.info(f"Mastodon HTTP health check exception when calling {MASTODON_HEALTH_URL}: {e}")
-        return False
+    ready, details = _get_mastodon_api_health()
+    if not ready:
+        logger.info(f"Mastodon web not ready: {details}")
+    return ready
 
 
 def is_mastodon_healthy() -> bool:

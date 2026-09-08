@@ -15,6 +15,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from loguru import logger
 
 from mobile_world.runtime.app_helpers.mall import get_config, write_callback_file
+from mobile_world.runtime.app_helpers.mastodon_gate import MastodonInitializationError
 from mobile_world.runtime.controller import AndroidController
 from mobile_world.runtime.utils.constants import ARTIFACTS_ROOT, device_dir
 from mobile_world.runtime.utils.docker import restart_emulator_with_avd
@@ -500,6 +501,9 @@ def init_task(req: TaskOperationRequest):
     try:
         task = task_registry.get_task(req.task_name)
         task.initialize_task(ctr)
+    except MastodonInitializationError as e:
+        logger.error(f"[TASK_INIT] Mastodon environment initialization failed: {e}")
+        raise HTTPException(status_code=503, detail=e.to_dict())
     except Exception as e:
         logger.error(f"[TASK_INIT] Error initializing task: {e}")
         raise HTTPException(status_code=500, detail=f"Error initializing task: {str(e)}")

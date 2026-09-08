@@ -71,6 +71,7 @@ def draw_drag_on_image(image_path, output_path, drag_coords):
 
 LOG_FILE_NAME = "traj.json"
 SCORE_FILE_NAME = "result.txt"
+INFRA_ERROR_FILE_NAME = "infra-error.json"
 
 
 class TrajLogger:
@@ -165,6 +166,14 @@ class TrajLogger:
 
         # reset tools after logging score
         self.tools = None
+
+    def log_infra_error(self, error: dict) -> None:
+        with open(
+            os.path.join(self.log_file_dir, INFRA_ERROR_FILE_NAME),
+            "w",
+            encoding="utf-8",
+        ) as error_file:
+            json.dump(error, error_file, ensure_ascii=False, indent=2)
 
     def log_token_usage(self, token_usage: dict[str, int]) -> None:
         """Log token usage to traj.json."""
